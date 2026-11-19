@@ -1,0 +1,253 @@
+diff --git a/llvm/include/llvm/CodeGen/MachineOperand.h b/llvm/include/llvm/CodeGen/MachineOperand.h
+index d85da5a4997f..8d4d3ad83550 100644
+--- a/llvm/include/llvm/CodeGen/MachineOperand.h
++++ b/llvm/include/llvm/CodeGen/MachineOperand.h
+@@ -153,6 +153,9 @@ private:
+   /// not a real instruction.  Such uses should be ignored during codegen.
+   unsigned IsDebug : 1;
+ 
++  // IsOptimalAllocated - True if this MO_Register was allocated using the optimal allocator
++  unsigned IsOptimalAllocated : 1;
++
+   /// SmallContents - This really should be part of the Contents union, but
+   /// lives out here so we can get a better packed struct.
+   /// MO_Register: Register number.
+@@ -208,14 +211,14 @@ private:
+   } Contents;
+ 
+   explicit MachineOperand(MachineOperandType K)
+-      : OpKind(K), SubReg_TargetFlags(0) {
++      : OpKind(K), SubReg_TargetFlags(0), IsOptimalAllocated(0) {
+     // Assert that the layout is what we expect. It's easy to grow this object.
+     static_assert(alignof(MachineOperand) <= alignof(int64_t),
+                   "MachineOperand shouldn't be more than 8 byte aligned");
+     static_assert(sizeof(Contents) <= 2 * sizeof(void *),
+                   "Contents should be at most two pointers");
+     static_assert(sizeof(MachineOperand) <=
+-                      alignTo<alignof(int64_t)>(2 * sizeof(unsigned) +
++                      alignTo<alignof(int64_t)>(3 * sizeof(unsigned) +
+                                                 3 * sizeof(void *)),
+                   "MachineOperand too big. Should be Kind, SmallContents, "
+                   "ParentMI, and Contents");
+@@ -482,6 +485,11 @@ public:
+     return isMetadata() || isMCSymbol();
+   }
+ 
++  bool isOptimalAllocated() const { 
++    assert(isReg() && "Wrong MachineOperand accessor");
++    return IsOptimalAllocated;
++  }
++
+   //===--------------------------------------------------------------------===//
+   // Mutators for Register Operands
+   //===--------------------------------------------------------------------===//
+@@ -553,6 +561,11 @@ public:
+     IsDebug = Val;
+   }
+ 
++  void setIsOptimalAllocated(bool Val = true) {
++    assert(isReg() && "Wrong MachineOperand accessor");
++    IsOptimalAllocated = Val;
++  }
++
+   //===--------------------------------------------------------------------===//
+   // Accessors for various operand types.
+   //===--------------------------------------------------------------------===//
+@@ -854,7 +867,7 @@ public:
+                                   bool isEarlyClobber = false,
+                                   unsigned SubReg = 0, bool isDebug = false,
+                                   bool isInternalRead = false,
+-                                  bool isRenamable = false) {
++                                  bool isRenamable = false, bool isOptimalAllocated = false) {
+     assert(!(isDead && !isDef) && "Dead flag on non-def");
+     assert(!(isKill && isDef) && "Kill flag on def");
+     MachineOperand Op(MachineOperand::MO_Register);
+@@ -867,6 +880,7 @@ public:
+     Op.IsEarlyClobber = isEarlyClobber;
+     Op.TiedTo = 0;
+     Op.IsDebug = isDebug;
++    Op.IsOptimalAllocated = isOptimalAllocated;
+     Op.SmallContents.RegNo = Reg.id();
+     Op.Contents.Reg.Prev = nullptr;
+     Op.Contents.Reg.Next = nullptr;
+diff --git a/llvm/include/llvm/CodeGen/MachineRegisterInfo.h b/llvm/include/llvm/CodeGen/MachineRegisterInfo.h
+index 737b74ef3f76..5940ae61fb18 100644
+--- a/llvm/include/llvm/CodeGen/MachineRegisterInfo.h
++++ b/llvm/include/llvm/CodeGen/MachineRegisterInfo.h
+@@ -433,6 +433,14 @@ public:
+     return VReg2Name.inBounds(Reg) ? StringRef(VReg2Name[Reg]) : "";
+   }
+ 
++  Register getVReg(StringRef Name) const {
++    for (int i = 0; i < VReg2Name.size(); i++) {
++      if (VReg2Name[i] == Name)
++        return Register::index2VirtReg(i);
++    }
++    return Register::index2VirtReg(atoi(Name.str().c_str()));
++  }
++
+   void insertVRegByName(StringRef Name, Register Reg) {
+     assert((Name.empty() || !VRegNames.contains(Name)) &&
+            "Named VRegs Must be Unique.");
+diff --git a/llvm/lib/CodeGen/VirtRegMap.cpp b/llvm/lib/CodeGen/VirtRegMap.cpp
+index 972bd8f550e8..192ed118749b 100644
+--- a/llvm/lib/CodeGen/VirtRegMap.cpp
++++ b/llvm/lib/CodeGen/VirtRegMap.cpp
+@@ -736,7 +736,11 @@ void VirtRegRewriter::rewrite() {
+         // Rewrite. Note we could have used MachineOperand::substPhysReg(), but
+         // we need the inlining here.
+         MO.setReg(PhysReg);
+-        MO.setIsRenamable(true);
++
++        if (MO.isOptimalAllocated())
++          MO.setIsRenamable(false);
++        else
++          MO.setIsRenamable(true);
+       }
+ 
+       // Add any missing super-register kills after rewriting the whole
+diff --git a/llvm/lib/Target/RISCV/CMakeLists.txt b/llvm/lib/Target/RISCV/CMakeLists.txt
+index 3b529c1471d5..953a52821708 100644
+--- a/llvm/lib/Target/RISCV/CMakeLists.txt
++++ b/llvm/lib/Target/RISCV/CMakeLists.txt
+@@ -28,6 +28,12 @@ tablegen(LLVM RISCVGenPreLegalizeGICombiner.inc -gen-global-isel-combiner
+ tablegen(LLVM RISCVGenPostLegalizeGICombiner.inc -gen-global-isel-combiner
+               -combiners="RISCVPostLegalizerCombiner")
+ 
++find_package(Python3 REQUIRED COMPONENTS Development)
++
++include_directories(${Python3_INCLUDE_DIRS})
++
++link_libraries(${Python3_LIBRARIES})
++
+ add_public_tablegen_target(RISCVCommonTableGen)
+ 
+ add_llvm_target(RISCVCodeGen
+@@ -41,6 +47,7 @@ add_llvm_target(RISCVCodeGen
+   RISCVFoldMemOffset.cpp
+   RISCVFrameLowering.cpp
+   RISCVGatherScatterLowering.cpp
++  RISCVILPRegAlloc.cpp
+   RISCVIndirectBranchTracking.cpp
+   RISCVInsertReadWriteCSR.cpp
+   RISCVInsertVSETVLI.cpp
+@@ -107,6 +114,30 @@ add_llvm_target(RISCVCodeGen
+   RISCV
+   )
+ 
++set_source_files_properties(
++  RISCVILPRegAlloc.cpp
++  PROPERTIES
++  COMPILE_OPTIONS "-fexceptions"
++)
++
++option(RISCV_ILP_USE_GUROBI "Enable Gurobi for ILP register allocation" OFF)
++
++if(RISCV_ILP_USE_GUROBI)
++  target_compile_definitions(LLVMRISCVCodeGen PRIVATE
++    RISCV_ILP_USE_GUROBI=1
++  )
++
++  target_link_libraries(LLVMCodeGen PRIVATE
++    /home/ruxi/Desktop/Workplace/RegAssign-ILP/gurobi1302/linux64/lib/libgurobi_c++.a
++    /home/ruxi/Desktop/Workplace/RegAssign-ILP/gurobi1302/linux64/lib/libgurobi130.so
++  )
++else()
++  target_compile_definitions(LLVMRISCVCodeGen PRIVATE
++    RISCV_ILP_USE_GUROBI=0
++  )
++endif()
++
++
+ add_subdirectory(AsmParser)
+ add_subdirectory(Disassembler)
+ add_subdirectory(MCTargetDesc)
+diff --git a/llvm/lib/Target/RISCV/RISCV.h b/llvm/lib/Target/RISCV/RISCV.h
+index 048db205e228..9027bd142933 100644
+--- a/llvm/lib/Target/RISCV/RISCV.h
++++ b/llvm/lib/Target/RISCV/RISCV.h
+@@ -133,6 +133,9 @@ FunctionPass *createRISCVVMV0EliminationPass();
+ void initializeRISCVVMV0EliminationPass(PassRegistry &);
+ 
+ void initializeRISCVAsmPrinterPass(PassRegistry &);
++
++FunctionPass * createRISCVILPRegAlloc();
++void initializeRISCVILPRegAllocPass(PassRegistry&);
+ } // namespace llvm
+ 
+ #endif
+diff --git a/llvm/lib/Target/RISCV/RISCVInstrInfo.cpp b/llvm/lib/Target/RISCV/RISCVInstrInfo.cpp
+index cf679d786ab6..f38e8e57fc37 100644
+--- a/llvm/lib/Target/RISCV/RISCVInstrInfo.cpp
++++ b/llvm/lib/Target/RISCV/RISCVInstrInfo.cpp
+@@ -725,7 +725,7 @@ void RISCVInstrInfo::storeRegToStackSlot(MachineBasicBlock &MBB,
+         MachinePointerInfo::getFixedStack(*MF, FI), MachineMemOperand::MOStore,
+         MFI.getObjectSize(FI), Alignment);
+ 
+-    BuildMI(MBB, I, DebugLoc(), get(Opcode))
++    BuildMI(MBB, I != nullptr ? I : MBB.end(), DebugLoc(), get(Opcode))
+         .addReg(SrcReg, getKillRegState(IsKill))
+         .addFrameIndex(FI)
+         .addImm(0)
+@@ -816,7 +816,7 @@ void RISCVInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
+         MachinePointerInfo::getFixedStack(*MF, FI), MachineMemOperand::MOLoad,
+         MFI.getObjectSize(FI), Alignment);
+ 
+-    BuildMI(MBB, I, DL, get(Opcode), DstReg)
++    BuildMI(MBB, I != nullptr ? I : MBB.end(), DL, get(Opcode), DstReg)
+         .addFrameIndex(FI)
+         .addImm(0)
+         .addMemOperand(MMO)
+diff --git a/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp b/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
+index 62a5cd3a7c84..a4675c6ff8f8 100644
+--- a/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
++++ b/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
+@@ -109,6 +109,10 @@ static cl::opt<bool> EnableCFIInstrInserter(
+     cl::desc("Enable CFI Instruction Inserter for RISC-V"), cl::init(false),
+     cl::Hidden);
+ 
++static cl::opt<cl::boolOrDefault>
++    EnableILPRegAlloc("riscv-enable-experimental-ilp-reg-alloc", cl::Hidden,
++    cl::desc("Enable the experimental ILP Register Allocator"));
++
+ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
+   RegisterTargetMachine<RISCVTargetMachine> X(getTheRISCV32Target());
+   RegisterTargetMachine<RISCVTargetMachine> Y(getTheRISCV64Target());
+@@ -147,6 +151,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
+   initializeRISCVRedundantCopyEliminationPass(*PR);
+   initializeRISCVAsmPrinterPass(*PR);
+   initializeRISCVPromoteConstantPass(*PR);
++  initializeRISCVILPRegAllocPass(*PR);
+ }
+ 
+ static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {
+@@ -413,6 +418,8 @@ public:
+   void addFastRegAlloc() override;
+   bool addILPOpts() override;
+ 
++  FunctionPass* createTargetRegisterAllocator(bool Optimized) override;
++
+   std::unique_ptr<CSEConfigBase> getCSEConfig() const override;
+ };
+ } // namespace
+@@ -440,6 +447,20 @@ FunctionPass *RISCVPassConfig::createRVVRegAllocPass(bool Optimized) {
+   return createFastRVVRegisterAllocator();
+ }
+ 
++FunctionPass * RISCVPassConfig::createTargetRegisterAllocator(bool Optimized) {
++   if (Optimized) {
++       if (EnableILPRegAlloc &&
++           TM->getMCSubtargetInfo()->hasFeature(RISCV::FeatureStdExtC)) {
++           addPass(createGreedyRegisterAllocator());
++           return createRISCVILPRegAlloc();
++       }
++       else
++           return createGreedyRegisterAllocator();
++    }
++    else
++       return createFastRegisterAllocator();
++}
++
+ bool RISCVPassConfig::addRegAssignAndRewriteFast() {
+   addPass(createRVVRegAllocPass(false));
+   addPass(createRISCVInsertVSETVLIPass());
